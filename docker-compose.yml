@@ -1,0 +1,28 @@
+services:
+  backend:
+    build: ./backend
+    image: lasting-atlas-api:latest
+    container_name: lasting-atlas-api
+    env_file:
+      - ./backend/.env
+    environment:
+      # Falls back to safe dev defaults if ./backend/.env is absent.
+      PROVIDER: ${PROVIDER:-mock}
+    volumes:
+      - atlas-data:/app/data
+    expose:
+      - "4000"
+    restart: unless-stopped
+
+  web:
+    build: .
+    image: lasting-atlas:latest
+    container_name: lasting-atlas
+    depends_on:
+      - backend
+    ports:
+      - "8080:80"
+    restart: unless-stopped
+
+volumes:
+  atlas-data:

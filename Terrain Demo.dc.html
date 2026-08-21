@@ -1,0 +1,567 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<style>
+  html,body{margin:0;height:100%;background:#091320;overflow:hidden}
+</style>
+</helmet>
+<div style="position:relative;width:100vw;height:100vh;overflow:hidden;background:#091320">
+  <canvas ref="{{ cref }}" style="position:absolute;inset:0;width:100%;height:100%;display:block;cursor:grab"></canvas>
+  <div style="position:absolute;left:20px;top:16px;z-index:5;font-family:Georgia,serif;color:#e7d8ad;font-size:12px;letter-spacing:.18em;text-shadow:0 2px 8px rgba(0,0,0,.7);pointer-events:none">
+    DIRECTIONAL HEX TILES · biome-aware edges · rotated transitions · animated water
+  </div>
+  <div style="position:absolute;left:20px;bottom:14px;z-index:5;font-family:Georgia,serif;color:rgba(231,216,173,.5);font-size:11px;pointer-events:none">
+    drag to pan · scroll to zoom
+  </div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script>
+class Component extends DCLogic {
+  cref = (el)=>{ this._cv=el; if(el && !this._started){ this._started=true; this._boot(); } };
+
+  async _boot(){
+    const load=src=>new Promise(r=>{const i=new Image();i.onload=()=>r(i);i.onerror=()=>r(null);i.src=src;});
+    // biome → ground texture
+    const map={
+      grass:'region_grass', forest:'region_forest_floor', savanna:'region_savanna',
+      desert:'region_desert', rock:'region_rock', snow:'region_snow', ocean:'htile_ocean_deep'
+    };
+    this.R={};
+    for(const b in map){ const im=await load('assets/'+map[b]+'.png'); if(im) this.R[b]=im; }
+    // sand↔grass real photo transition
+    const sg=await load('assets/htile_sand_grass.png'); if(sg) this.R.sandgrass=sg;
+    const sgv2=await load('assets/htile_desert_grass_rect.png'); if(sgv2) this.R.desertGrassTile=sgv2;
+    // real uploaded coast tile (sand→water), used for any land→ocean edge
+    this.coastTile = await load('assets/coast_foam.png');
+    this.water = await load('assets/region_ocean.png');
+    this.R.sand = this.R.desert;
+    this.cliffTile = await load('assets/coast_cliff_tile.png');
+    this.size=72;                       // hex circumradius in world units
+    this.cam={x:600,y:500,zoom:1};
+    this._overlayCache={};
+    this._transCache={};
+    window.addEventListener('resize', this._size);
+    this._size();
+    // input
+    const cv=this._cv;
+    cv.addEventListener('mousedown',e=>{ this._drag=true; this._pp={x:e.clientX,y:e.clientY}; cv.style.cursor='grabbing'; });
+    window.addEventListener('mouseup',()=>{ this._drag=false; if(this._cv)this._cv.style.cursor='grab'; });
+    window.addEventListener('mousemove',e=>{ if(!this._drag)return; this.cam.x-=(e.clientX-this._pp.x)/this.cam.zoom; this.cam.y-=(e.clientY-this._pp.y)/this.cam.zoom; this._pp={x:e.clientX,y:e.clientY}; this._bake(); });
+    cv.addEventListener('wheel',e=>{ e.preventDefault(); const z=this.cam.zoom*(e.deltaY<0?1.1:0.9); this.cam.zoom=Math.max(0.5,Math.min(3,z)); this._bake(); },{passive:false});
+    this._bake();
+    this._loop();
+  }
+
+  _size=()=>{ const cv=this._cv; const dpr=Math.min(2,window.devicePixelRatio||1); cv.width=cv.offsetWidth*dpr; cv.height=cv.offsetHeight*dpr; this._dpr=dpr; this._w=cv.offsetWidth; this._h=cv.offsetHeight; this._bake&&this._bake(); };
+
+  // ---- noise ----
+  _h2(x,y){ let n=Math.sin(x*127.1+y*311.7)*43758.5453; return n-Math.floor(n); }
+  _vn(x,y){ const xi=Math.floor(x),yi=Math.floor(y),xf=x-xi,yf=y-yi; const u=xf*xf*(3-2*xf),v=yf*yf*(3-2*yf); const a=this._h2(xi,yi),b=this._h2(xi+1,yi),c=this._h2(xi,yi+1),d=this._h2(xi+1,yi+1); return a*(1-u)*(1-v)+b*u*(1-v)+c*(1-u)*v+d*u*v; }
+  _fbm(x,y,o){ let s=0,a=0.5,f=1; for(let i=0;i<o;i++){ s+=a*this._vn(x*f,y*f); f*=2; a*=0.5; } return s; }
+
+  // ---- world / hex geometry (pointy-top axial) ----
+  _axialToWorld(q,r){ const s=this.size; return [ s*Math.sqrt(3)*(q + r/2), s*1.5*r ]; }
+  _worldToAxial(wx,wy){ const s=this.size; const r=wy/(s*1.5); const q=wx/(s*Math.sqrt(3)) - r/2; return [q,r]; }
+  _w2s(wx,wy){ const z=this.cam.zoom; return [ (wx-this.cam.x)*z + this._w/2, (wy-this.cam.y)*z + this._h/2 ]; }
+
+  // ---- biome model ----
+  _coastX(wy){ return 150 + 230*Math.sin(wy*0.0019) + 150*this._fbm(wy*0.004+10,3.3,3); }
+  _isLand(wx,wy){ return wx > this._coastX(wy) + this._fbm(wx*0.0016,wy*0.0016,3)*120 - 40; }
+  _biomeAt(wx,wy){
+    if(!this._isLand(wx,wy)) return 'ocean';
+    const n=(this._fbm(wx*0.011+50,wy*0.011+30,3)-0.5)*0.22 + (this._fbm(wx*0.04+5,wy*0.04+9,2)-0.5)*0.10;
+    const cold=this._fbm(wx*0.0013+70,wy*0.0013,3) + (wy<0?0.2:0);   // snow zones
+    const mtn=this._fbm(wx*0.0016+200,wy*0.0016+90,4);                // mountains
+    const dry=this._fbm(wx*0.0015+400,wy*0.0015+200,3);              // arid
+    const moist=this._fbm(wx*0.0017+20,wy*0.0017+9,4);               // forest
+    if(cold+n>0.66) return 'snow';
+    if(mtn+n>0.66) return 'rock';
+    if(dry+n>0.66) return (dry+n>0.74? 'desert':'savanna');
+    if(moist+n>0.60) return 'forest';
+    return 'grass';
+  }
+  _biomeKey(q,r){ const [wx,wy]=this._axialToWorld(q,r); return this._biomeAt(wx,wy); }
+  _displayBiome(q,r){ const b=this._biomeKey(q,r); if(b==='ocean') return 'ocean'; for(const [dq,dr] of this._NB()) if(this._biomeKey(q+dq,r+dr)==='ocean') return 'sand'; return b; }
+
+  // axial neighbor deltas (pointy-top) and their screen angles
+  _NB(){ return [[1,0],[1,-1],[0,-1],[-1,0],[-1,1],[0,1]]; }
+  _nbAngle(dq,dr){ const s=this.size; const dx=s*Math.sqrt(3)*(dq+dr/2), dy=s*1.5*dr; return Math.atan2(dy,dx); }
+
+  // hex path in screen space
+  _hexPath(g,cx,cy,rad){ g.beginPath(); for(let k=0;k<6;k++){ const a=Math.PI/180*(60*k-90); const x=cx+rad*Math.cos(a),y=cy+rad*Math.sin(a); k?g.lineTo(x,y):g.moveTo(x,y);} g.closePath(); }
+
+  // build a B-only alpha-gradient overlay (transparent top → opaque bottom) for land→land transitions
+  _overlay(biome){
+    if(this._overlayCache[biome]) return this._overlayCache[biome];
+    const img=this.R[biome]; if(!img) return null;
+    const T=256, Th=Math.round(T*1.16);
+    const cv=document.createElement('canvas'); cv.width=T; cv.height=Th; const c=cv.getContext('2d');
+    // tile the texture to fill
+    const pat=c.createPattern(img,'repeat'); c.fillStyle=pat; c.fillRect(0,0,T,Th);
+    // smooth wide vertical crossfade — NO noisy notches (those caused the blotchy clumps)
+    c.globalCompositeOperation='destination-in';
+    const m=document.createElement('canvas'); m.width=T; m.height=Th; const mc=m.getContext('2d');
+    const grd=mc.createLinearGradient(0,Th*0.10,0,Th*0.95);
+    grd.addColorStop(0,'rgba(0,0,0,0)');
+    grd.addColorStop(0.45,'rgba(0,0,0,0.18)');
+    grd.addColorStop(0.78,'rgba(0,0,0,0.85)');
+    grd.addColorStop(1,'rgba(0,0,0,1)');
+    mc.fillStyle=grd; mc.fillRect(0,0,T,Th);
+    c.drawImage(m,0,0);
+    this._overlayCache[biome]=cv; return cv;
+  }
+
+  // ---- bake the static terrain into an offscreen buffer (on pan / zoom only) ----
+  _bake(){
+    if(!this.R.grass||!this._w) return;
+    const W=this._w,H=this._h,dpr=this._dpr,z=this.cam.zoom,s=this.size;
+    if(!this._buf) this._buf=document.createElement('canvas');
+    const buf=this._buf; buf.width=W*dpr; buf.height=H*dpr;
+    const g=buf.getContext('2d'); g.scale(dpr,dpr);
+    g.clearRect(0,0,W,H);
+    // visible axial range
+    const corners=[[0,0],[W,0],[0,H],[W,H]].map(([sx,sy])=>{ const wx=this.cam.x+(sx-W/2)/z, wy=this.cam.y+(sy-H/2)/z; return this._worldToAxial(wx,wy); });
+    let qMin=1e9,qMax=-1e9,rMin=1e9,rMax=-1e9;
+    for(const [q,r] of corners){ qMin=Math.min(qMin,q);qMax=Math.max(qMax,q);rMin=Math.min(rMin,r);rMax=Math.max(rMax,r); }
+    qMin=Math.floor(qMin)-2;qMax=Math.ceil(qMax)+2;rMin=Math.floor(rMin)-2;rMax=Math.ceil(rMax)+2;
+    const rad=s*z*1.02;
+    const oceanHexes=[]; const coast=[];
+    const NB=this._NB();
+        // terrain now drawn inline in _loop via _drawLand (avoids bake buffer compositing issues)
+    for(let r=rMin;r<=rMax;r++) for(let q=qMin;q<=qMax;q++){
+      const [wx,wy]=this._axialToWorld(q,r); const [cx,cy]=this._w2s(wx,wy);
+      if(cx<-rad||cx>W+rad||cy<-rad||cy>H+rad) continue;
+      // Grid lines only — biome textures painted as continuous world-anchored layers before this loop
+      const A=this._displayBiome(q,r);
+      if(A==='ocean') continue;
+      for(const [dq,dr] of NB){ if(this._displayBiome(q+dq,r+dr)==='ocean') coast.push([cx,cy,rad,this._nbAngle(dq,dr)]); }
+      g.strokeStyle='rgba(228,206,120,0.15)'; g.lineWidth=1; this._hexPath(g,cx,cy,rad*0.99); g.stroke();
+    }
+    this._coast=coast;
+    this._baked=true;
+  }
+
+  // Single source of truth for how wide the dry-land sand strip is (water edge → grass start),
+  // shared by the land polygon inset, the sand band, and the grass-blend pivot so the three
+  // stay locked together in the correct left→right order regardless of zoom.
+  _sandBandW(){ return Math.max(70,120*this.cam.zoom); }
+
+  _drawLand(ctx,W,H){
+    if(!this.R.grass) return;
+    const z=this.cam.zoom, cx0=this.cam.x, cy0=this.cam.y;
+    const ts=Math.max(80,z*this.size*5);
+    const ox=((cx0*z)%ts+ts)%ts, oy=((cy0*z)%ts+ts)%ts;
+    const pat=ctx.createPattern(this.R.grass,'repeat'); if(!pat) return;
+    // Compute coast as a set of (lx, sy) pairs
+    const pts=[];
+    for(let sy=-20;sy<=H+20;sy+=8){ const wy=cy0+(sy-H/2)/z; const lx=(this._coastX(wy)+this._fbm(wy*0.002+1,wy*0.002,3)*120-40-cx0)*z+W/2; pts.push([lx,sy]); }
+    if(pts.length<2) return;
+    // inset grass polygon so it only starts AFTER the full sand strip — grass never creeps
+    // toward the water edge, and the sand band never has to cover exposed grass.
+    const inset=this._sandBandW();
+    ctx.save();
+    ctx.beginPath();
+    ctx.moveTo(pts[0][0]+inset,pts[0][1]);
+    for(let i=1;i<pts.length;i++) ctx.lineTo(pts[i][0]+inset,pts[i][1]);
+    ctx.lineTo(W+40,pts[pts.length-1][1]);
+    ctx.lineTo(W+40,pts[0][1]);
+    ctx.closePath();
+    ctx.clip();
+    ctx.translate(-ox,-oy); ctx.fillStyle=pat; ctx.fillRect(ox-ts,oy-ts,W+ts*2,H+ts*2);
+    ctx.restore();
+  }
+  _drawCoastSand(ctx,W,H){
+    const z=this.cam.zoom,cx0=this.cam.x,cy0=this.cam.y;
+    const sandW=this._sandBandW();
+    // world-unit scale of the noisy sand<->grass mixing zone, and how far past the blend pivot
+    // it takes for the mask to fully saturate to grass. The opaque sand fill below MUST physically
+    // reach at least this far inland, or its own hard polygon edge ends up slicing across a
+    // still-partial (not yet fully green) mask — that mismatch, not the mask itself, was the
+    // visible "hard seam" between sand and grass at close zoom.
+    const bandWorld=26;
+    const blendReachWorld=3.4*bandWorld+14;
+    const inlandPad=blendReachWorld*z;
+    // collect coast path points — this is the true ocean/land water-edge line (same formula as
+    // land polygon + foam), so sand is drawn strictly INLAND of it and never bleeds into the ocean.
+    const pts=[];
+    for(let sy=-20;sy<=H+20;sy+=4){ const wy=cy0+(sy-H/2)/z; pts.push((this._coastX(wy)+this._fbm(wy*0.002+1,wy*0.002,3)*120-40-cx0)*z+W/2); }
+    if(pts.length<2) return;
+    // draw sand band: tile real desert texture, mask to a one-sided strip from the water edge
+    // inland to sandW — nothing to the ocean side of the line, keeping the blue water clean.
+    const off=document.createElement('canvas'); off.width=W; off.height=H;
+    const oc=off.getContext('2d');
+    if(this.R.desert){
+      const ts=Math.max(80,sandW*3);
+      const ox=((cx0*z)%ts+ts)%ts, oy=((cy0*z)%ts+ts)%ts;
+      const pat=oc.createPattern(this.R.desert,'repeat');
+      oc.save(); oc.translate(-ox,-oy); oc.fillStyle=pat; oc.fillRect(ox-ts,oy-ts,W+ts*2,H+ts*2); oc.restore();
+    } else {
+      oc.fillStyle='rgba(192,162,82,1)'; oc.fillRect(0,0,W,H);
+    }
+    oc.globalCompositeOperation='destination-in';
+    oc.beginPath();
+    oc.moveTo(pts[0]-6,-20);
+    for(let i=1;i<pts.length;i++) oc.lineTo(pts[i]-6,-20+i*4);
+    // right edge must hug the SAME curve (offset by sandW), not shortcut straight from the
+    // bottom corner to the top corner — a straight diagonal there cuts across the ribbon
+    // wherever the coast bends, slicing it into a self-crossing bowtie.
+    for(let i=pts.length-1;i>=0;i--) oc.lineTo(pts[i]+sandW+inlandPad,-20+i*4);
+    oc.closePath();
+    oc.fillStyle='rgba(0,0,0,1)'; oc.fill();
+    oc.globalCompositeOperation='source-over';
+    // composite sand band with only a light feather — the water-edge side of the strip stays
+    // crisp so the foam has a real edge to sit on, instead of dissolving into the ocean.
+    ctx.save();
+    try{ ctx.filter='blur(4px)'; } catch(e){}
+    ctx.drawImage(off,0,0);
+    try{ ctx.filter='none'; } catch(e){}
+    ctx.restore();
+
+    // --- grass fades in over the inland half of the sand band ---
+    // Uses the SAME seamless grass texture as the main land fill — since it's the identical
+    // tileable pattern (not a separately-shaped stamped image), blurring it can only soften
+    // edges, never reveal a silhouette. This is the artifact-free base blend.
+    // --- organic noisy transition: grass patches sprout INSIDE sand, bare soil patches sit
+    // INSIDE grass — built from fbm noise thresholded against distance-from-coast, so the
+    // boundary is never a clean curve. Cached per camera position (low-res, upscaled) so it
+    // stays cheap even though it's a genuine per-pixel noise field, not a blurred stroke.
+    if(this.R.grass){
+      const camKey=Math.round(cx0*z)+'|'+Math.round(cy0*z)+'|'+Math.round(z*100);
+      if(this._transMaskKey!==camKey){
+        const LR=4; const lw=Math.ceil(W/LR), lh=Math.ceil(H/LR);
+        const low=document.createElement('canvas'); low.width=lw; low.height=lh;
+        const lctx=low.getContext('2d'); const limg=lctx.createImageData(lw,lh);
+        const bandWorld=26; // world-unit half-width of the organic mixing zone — keep in sync
+                            // with the bandWorld used above to size the sand band's inland reach
+        const sandWWorld=sandW/z; // dry-sand strip width, in world units — grass blend pivots
+                                   // this far INLAND of the water edge, never near the foam/wet sand
+        for(let ly=0;ly<lh;ly++){
+          for(let lx=0;lx<lw;lx++){
+            const sx=lx*LR, sy=ly*LR;
+            const wx=cx0+(sx-W/2)/z, wy=cy0+(sy-H/2)/z;
+            const coastLx=this._coastX(wy)+this._fbm(wy*0.002+1,wy*0.002,3)*120-40;
+            const pivot=coastLx+sandWWorld;
+            // Domain-warp the transition curve itself with large-scale noise so the boundary is
+            // a genuinely wiggly coastline, not a smooth offset of the water edge — this alone
+            // kills the "clean curve/mask" look before any alpha blending happens.
+            const warp=(this._fbm(wx*0.021+500,wy*0.021+500,4)-0.5)*2*20;
+            const t=(wx+warp-pivot)/bandWorld;
+            let a=1/(1+Math.exp(-t*1.9));
+            // fine speckle: feathers the edge with grain instead of a smooth gradient
+            const speck=(this._fbm(wx*0.13+80,wy*0.13+80,3)-0.5)*0.3;
+            a+=speck;
+            // sparse islands: an independent blobby noise field pulls alpha toward the OPPOSITE
+            // extreme in scattered patches — grass islands stranded in sand, bare soil patches
+            // stranded in grass. `proximity` keeps islands concentrated near the boundary but
+            // never fully forbids them further out, so neither side is ever a flat solid mask.
+            const blob=this._fbm(wx*0.03+900,wy*0.03+900,3);
+            const proximity=Math.exp(-(t*t)/3.4);
+            a += (blob-0.5)*2*(0.32+0.5*proximity)*0.6;
+            a=Math.max(0,Math.min(1,a));
+            // only far out on either side does it fully lock to pure sand / pure grass, keeping
+            // open ocean and deep interior clean of stray patches
+            if(Math.abs(t)>3.4) a = t>0?1:0;
+            const idx=(ly*lw+lx)*4;
+            limg.data[idx]=limg.data[idx+1]=limg.data[idx+2]=0;
+            limg.data[idx+3]=Math.round(a*255);
+          }
+        }
+        lctx.putImageData(limg,0,0);
+        const full=document.createElement('canvas'); full.width=W; full.height=H;
+        const fctx=full.getContext('2d');
+        fctx.imageSmoothingEnabled=true;
+        fctx.drawImage(low,0,0,W,H);
+        this._transMask=full; this._transMaskKey=camKey;
+      }
+      if(this._transMask){
+        const ts3=Math.max(80,z*this.size*5);
+        const oxg=((cx0*z)%ts3+ts3)%ts3, oyg=((cy0*z)%ts3+ts3)%ts3;
+        const patG=ctx.createPattern(this.R.grass,'repeat');
+        const g3=document.createElement('canvas'); g3.width=W; g3.height=H;
+        const gg=g3.getContext('2d');
+        gg.save(); gg.translate(-oxg,-oyg); gg.fillStyle=patG; gg.fillRect(oxg-ts3,oyg-ts3,W+ts3*2,H+ts3*2); gg.restore();
+        gg.globalCompositeOperation='destination-in';
+        gg.drawImage(this._transMask,0,0);
+        gg.globalCompositeOperation='source-over';
+        ctx.drawImage(g3,0,0,W,H);
+      }
+    }
+  }
+  _loop=()=>{
+    this._raf=requestAnimationFrame(this._loop);
+    if(!this._baked) return;
+    const cv=this._cv, ctx=cv.getContext('2d'), W=this._w,H=this._h,dpr=this._dpr;
+    const t=performance.now()*0.001;
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+    this._drawOcean(ctx,W,H,t);        // 1. ocean everywhere
+    this._drawLand(ctx,W,H);             // 2. grass polygon over land only
+    this._drawCoastSand(ctx,W,H);        // 3. smooth sand transition at coast
+    // 4. hex grid lines — clipped to land only, so no grid fragments ever show over open ocean
+    ctx.save();
+    { const z2=this.cam.zoom,cx2=this.cam.x,cy2=this.cam.y;
+      const pts2=[]; for(let sy2=-20;sy2<=H+20;sy2+=8){ const wy2=cy2+(sy2-H/2)/z2; const lx2=(this._coastX(wy2)+this._fbm(wy2*0.002+1,wy2*0.002,3)*120-40-cx2)*z2+W/2; pts2.push([lx2,sy2]); }
+      if(pts2.length>=2){ ctx.beginPath(); ctx.moveTo(pts2[0][0],pts2[0][1]); for(let i=1;i<pts2.length;i++) ctx.lineTo(pts2[i][0],pts2[i][1]); ctx.lineTo(W+40,pts2[pts2.length-1][1]); ctx.lineTo(W+40,pts2[0][1]); ctx.closePath(); ctx.clip(); }
+    }
+    ctx.drawImage(this._buf,0,0,W,H);
+    ctx.restore();
+    this._drawCoastFoam(ctx,t);        // natural surging foam only at the coastline
+  };
+
+  _drawOcean(ctx,W,H,t){
+    // Continuous, analytically-anchored depth gradient (deep navy offshore -> shallow turquoise
+    // at the coast) replaces the old per-hex radial-glow patches — those were quantized to hex
+    // positions and produced a visible ring-like seam where many gradients' outer edges lined up.
+    // This field is cached per camera position (like the sand/grass mix mask) so it stays cheap.
+    this._drawDepthField(ctx,W,H);
+    if(!this.water) return;
+    const z=this.cam.zoom, img=this.water;
+    const tileLayer=(scale,driftX,driftY,parX,parY,alpha,comp)=>{
+      const tw=img.width*scale, th=img.height*scale;
+      let ox=(-this.cam.x*z*parX + driftX)%tw; if(ox>0)ox-=tw;
+      let oy=(-this.cam.y*z*parY + driftY)%th; if(oy>0)oy-=th;
+      ctx.save(); ctx.globalAlpha=alpha; if(comp)ctx.globalCompositeOperation=comp;
+      for(let x=ox;x<W;x+=tw) for(let y=oy;y<H;y+=th) ctx.drawImage(img,x,y,tw,th);
+      ctx.restore();
+    };
+    // two drifting layers at different speeds → organic continuous motion (no seams, no lines)
+    tileLayer(0.85*z, t*10, t*6, 0.30, 0.30, 0.30, null);
+    tileLayer(1.35*z, -t*7, -t*4, 0.18, 0.18, 0.12, 'overlay');
+    // slow specular glint band sweeping across
+    ctx.save(); ctx.globalCompositeOperation='lighter';
+    const gx=((t*40)%(W+400))-200;
+    const sg=ctx.createLinearGradient(gx-180,0,gx+180,0);
+    sg.addColorStop(0,'rgba(120,180,200,0)'); sg.addColorStop(0.5,'rgba(150,205,225,0.05)'); sg.addColorStop(1,'rgba(120,180,200,0)');
+    ctx.fillStyle=sg; ctx.fillRect(gx-180,0,360,H);
+    ctx.restore();
+  }
+
+  // Smooth, noise-driven sea-depth field: distance from the true analytic coastline (same
+  // formula used by sand/foam/grid) drives a wide soft color ramp from shallow turquoise to
+  // deep navy; large-scale domain warp + cloudy patches + fine grain keep it from ever reading
+  // as a clean mask line or an artificial linear/radial gradient.
+  _drawDepthField(ctx,W,H){
+    const z=this.cam.zoom, cx0=this.cam.x, cy0=this.cam.y;
+    const camKey=Math.round(cx0*z)+'|'+Math.round(cy0*z)+'|'+Math.round(z*100);
+    if(this._depthFieldKey!==camKey){
+      const LR=4, lw=Math.ceil(W/LR), lh=Math.ceil(H/LR);
+      const low=document.createElement('canvas'); low.width=lw; low.height=lh;
+      const lctx=low.getContext('2d'); const limg=lctx.createImageData(lw,lh);
+      const shallowRangeWorld=260; // wide — the transition spans a large swath of open water
+      const stops=[
+        {t:0.00, c:[100,196,190]},  // shallow turquoise right at the sand
+        {t:0.32, c:[46,138,152]},   // teal
+        {t:0.64, c:[21,80,116]},    // medium blue
+        {t:1.00, c:[8,27,46]}       // deep navy offshore
+      ];
+      const colorAt=(tt)=>{
+        tt=tt<0?0:(tt>1?1:tt);
+        for(let i=0;i<stops.length-1;i++){
+          const a=stops[i], b=stops[i+1];
+          if(tt<=b.t){
+            const span=(b.t-a.t)||1, f=(tt-a.t)/span;
+            return [a.c[0]+(b.c[0]-a.c[0])*f, a.c[1]+(b.c[1]-a.c[1])*f, a.c[2]+(b.c[2]-a.c[2])*f];
+          }
+        }
+        return stops[stops.length-1].c;
+      };
+      for(let ly=0;ly<lh;ly++){
+        for(let lx=0;lx<lw;lx++){
+          const sx=lx*LR, sy=ly*LR;
+          const wx=cx0+(sx-W/2)/z, wy=cy0+(sy-H/2)/z;
+          const coastLx=this._coastX(wy)+this._fbm(wy*0.002+1,wy*0.002,3)*120-40;
+          // large-scale warp so depth bands wander instead of running perfectly parallel to
+          // the coastline shape — this alone keeps the ramp from reading as a traced mask
+          const warp=(this._fbm(wx*0.008+700,wy*0.008+700,4)-0.5)*2*70;
+          const dist=coastLx-(wx+warp); // world units offshore (bigger = deeper)
+          let tt=dist/shallowRangeWorld;
+          // cloudy depth patches (coarse) + fine grain — gentle, irregular underwater variation
+          const cloud=this._fbm(wx*0.006+300,wy*0.006+300,4);
+          const grain=this._fbm(wx*0.03+90,wy*0.03+90,3);
+          tt += (cloud-0.5)*0.55 + (grain-0.5)*0.12;
+          const [r,g,b]=colorAt(tt);
+          const idx=(ly*lw+lx)*4;
+          limg.data[idx]=r; limg.data[idx+1]=g; limg.data[idx+2]=b; limg.data[idx+3]=255;
+        }
+      }
+      lctx.putImageData(limg,0,0);
+      const full=document.createElement('canvas'); full.width=W; full.height=H;
+      const fctx=full.getContext('2d'); fctx.imageSmoothingEnabled=true;
+      fctx.drawImage(low,0,0,W,H);
+      this._depthField=full; this._depthFieldKey=camKey;
+    }
+    if(this._depthField) ctx.drawImage(this._depthField,0,0,W,H);
+  }
+
+
+  _drawCoastFoam(ctx,t){
+    // Swash zone: deep water -> shallow water (handled in _drawShallows) -> active foam edge ->
+    // thin water film over sand -> irregular wet sand -> dry sand. Everything below is a noise-
+    // driven alpha field (same family of technique as the sand/grass transition mask) rather than
+    // a filled polygon, so edges are soft and boundaries are never a clean geometric line. All of
+    // it is still anchored to the analytic coastline formula, so it can never detach from the
+    // real water edge or float independently of it.
+    const z=this.cam.zoom,cx0=this.cam.x,cy0=this.cam.y,W=this._w,H=this._h;
+    const sandW=this._sandBandW();
+    const maxReach=Math.min(sandW*0.4, 40);
+    // the swash never fully collapses to zero reach, and the water-side start always sits well
+    // inside the water — together these guarantee the foam/film always bridges water and sand,
+    // instead of occasionally shrinking down to reveal a strip of bare sand between them.
+    const floorReach=maxReach*0.55;
+    const waterOverlap=Math.max(20, maxReach*0.6);
+    const hash3=(a,b)=>{ let n=Math.sin(a*127.1+b*311.7)*43758.5453; return n-Math.floor(n); };
+    const step=4;
+    const nP=Math.ceil((H+60)/step);
+
+    // world-anchored wetness memory (keyed by world-y, not screen row) — rises instantly to the
+    // current run-up, then decays slowly in real time. This is what leaves irregular wet streaks
+    // behind after the foam pulls back, instead of the sand drying the instant the water does.
+    if(!this._wetMemory) this._wetMemory=new Map();
+    if(this._lastFoamT===undefined) this._lastFoamT=t;
+    let dt=t-this._lastFoamT; if(!(dt>=0)||dt>0.15) dt=0.03; this._lastFoamT=t;
+    const decay=Math.exp(-dt/2.6);
+
+    const coastSx=new Array(nP), reach=new Array(nP), wetRow=new Array(nP), rowWy=new Array(nP);
+    for(let k=0;k<nP;k++){
+      const sy=-30+k*step;
+      const wy=cy0+(sy-H/2)/z;
+      rowWy[k]=wy;
+      coastSx[k]=(this._coastX(wy)+this._fbm(wy*0.002+1,wy*0.002,3)*120-40-cx0)*z+W/2;
+      // slow, spatially-varying amplitude and phase along the shore — distinct stretches of coast
+      // are out of sync with each other, so some lobes push farther onto the sand than others
+      // instead of the whole shoreline surging as one synchronized strip.
+      const rowAmp=0.55+0.85*this._fbm(wy*0.004+91,12.2,3);
+      const rowPhase=this._fbm(wy*0.01+5,44.4,2)*6.283;
+      const base=0.5+0.5*Math.sin(t*0.55+rowPhase);
+      const jag=(this._fbm(wy*0.09+t*0.22,9.1,3)-0.5)*maxReach*0.5;
+      const r=Math.max(floorReach,maxReach*rowAmp*(0.28+0.72*base)+jag);
+      reach[k]=r;
+      const bucket=Math.round(wy/6);
+      const prev=this._wetMemory.get(bucket)||0;
+      const level=Math.max(r, prev*decay);
+      this._wetMemory.set(bucket, level);
+      wetRow[k]=level;
+    }
+    if(this._wetMemory.size>6000) this._wetMemory.clear();
+
+    // layer 1 (back) wet sand + layer 2 (mid) thin water film — both built as a per-cell noise
+    // field, drawn to an offscreen buffer and blurred on composite for genuinely soft edges.
+    if(!this._swashCv){ this._swashCv=document.createElement('canvas'); }
+    const sc=this._swashCv; sc.width=W; sc.height=H;
+    const g=sc.getContext('2d');
+    g.clearRect(0,0,W,H);
+    for(let k=0;k<nP-1;k++){
+      const sy=-30+k*step;
+      const wy=rowWy[k];
+      const cs=coastSx[k], r=reach[k], wr=wetRow[k];
+      const xFrom=cs-waterOverlap-8, xTo=cs+Math.max(r,wr)+22;
+      if(xTo<=xFrom) continue;
+      for(let sx=xFrom; sx<=xTo; sx+=4){
+        const d=sx-cs; // screen px inland from the water edge (negative = still over water)
+        const wx=cx0+(sx-W/2)/z;
+        // permanent shallow-water film: always present regardless of wave phase, straddling the
+        // true water/sand contact line on BOTH sides — this is what guarantees the two always
+        // visually touch (a translucent teal wash over the sand edge), independent of the
+        // animated surge/retreat noise layered on top of it.
+        {
+          const distFromEdge=d+4;
+          const film=Math.exp(-(distFromEdge*distFromEdge)/(2*waterOverlap*waterOverlap*0.42));
+          const a=film*0.5;
+          if(a>0.02){ g.fillStyle=`rgba(110,188,202,${a.toFixed(3)})`; g.fillRect(sx,sy-1.5,4,step+1); }
+        }
+        // irregular wet sand: darkest near the water, fading toward dry sand — modulated by
+        // streak noise so it is never a uniform band, with occasional damp reflective sheen
+        if(d>-2 && d<wr+10){
+          const streak=this._fbm(wx*0.05,wy*0.05,2);
+          const fadeOut=Math.max(0,1-Math.max(0,d)/Math.max(6,wr));
+          let a=fadeOut*fadeOut*(0.16+0.4*streak);
+          if(d<0) a*=Math.max(0,1+d/4);
+          if(a>0.015){
+            g.fillStyle=`rgba(42,33,20,${a.toFixed(3)})`;
+            g.fillRect(sx,sy-1.5,4,step+1);
+          }
+          const sparkle=this._fbm(wx*0.22+40,wy*0.22+t*0.05,2);
+          if(sparkle>0.72 && d>wr*0.12 && d<wr*0.92){
+            const sa=(0.08+0.16*(sparkle-0.72)/0.28)*fadeOut;
+            g.fillStyle=`rgba(206,224,224,${sa.toFixed(3)})`;
+            g.fillRect(sx,sy-1.5,4,step+1);
+          }
+        }
+        // thin water sheet actively sliding over the sand, roughly between the foam edge and
+        // halfway back — patchy and semi-transparent rather than a solid wash
+        if(d>-6 && d<r+6){
+          const filmN=this._fbm(wx*0.13+t*0.6,wy*0.13,2);
+          const edgeFade=1-Math.min(1,Math.abs(d-r*0.5)/(r*0.75+6));
+          const a=Math.max(0,edgeFade)*(0.08+0.20*filmN);
+          if(a>0.015){ g.fillStyle=`rgba(150,200,208,${a.toFixed(3)})`; g.fillRect(sx,sy-1.5,4,step+1); }
+        }
+      }
+      // fragmented foam lace at the active breaking edge — short curved strokes gapped by noise,
+      // broken up both along the shore and across it, so it reads as scattered lace, not a line
+      const segN=5;
+      for(let s=0;s<segN;s++){
+        const tt0=s/segN, tt1=(s+1)/segN;
+        const dd0=r*(0.5+0.55*tt0), dd1=r*(0.5+0.55*tt1);
+        const presence=this._fbm(k*0.4+s*1.7+t*0.5,21.3,2);
+        if(presence<0.4) continue;
+        const alpha=0.26+0.5*Math.min(1,(presence-0.4)/0.35);
+        const x1=cs+dd0+(hash3(k,s+1)-0.5)*3, y1=sy+(hash3(k+1,s)-0.5)*step*0.8;
+        const x2=cs+dd1+(hash3(k+2,s+2)-0.5)*3, y2=sy+step+(hash3(k+3,s+1)-0.5)*step*0.8;
+        const mx=(x1+x2)/2+(hash3(k+5,s+3)-0.5)*4, my=(y1+y2)/2;
+        g.strokeStyle=`rgba(255,255,255,${alpha.toFixed(3)})`;
+        g.lineWidth=0.8+hash3(k+s*7,2.7)*1.0;
+        g.lineCap='round';
+        g.beginPath(); g.moveTo(x1,y1); g.quadraticCurveTo(mx,my,x2,y2); g.stroke();
+      }
+      // permanent edge lace: a second, independent scatter of short foam strokes clustered
+      // tightly around d=0 — the resting water/sand contact line — so a bit of foam sits right
+      // on the boundary itself (straddling into the shallow water) at all times, not just at
+      // the leading edge of the current surge further onto the sand.
+      const segE=4;
+      for(let s=0;s<segE;s++){
+        const presence=this._fbm(k*0.6+s*2.3+t*0.4+77,31.1,2);
+        if(presence<0.35) continue;
+        const alpha=0.2+0.4*Math.min(1,(presence-0.35)/0.4);
+        const dd0=-9+ (hash3(k+s,4.4))*10, dd1=dd0+3+hash3(k+s+1,6.6)*7;
+        const x1=cs+dd0+(hash3(k,s+9)-0.5)*3, y1=sy+(hash3(k+1,s+3)-0.5)*step*0.8;
+        const x2=cs+dd1+(hash3(k+2,s+5)-0.5)*3, y2=sy+step+(hash3(k+3,s+4)-0.5)*step*0.8;
+        const mx=(x1+x2)/2+(hash3(k+6,s+8)-0.5)*4, my=(y1+y2)/2;
+        g.strokeStyle=`rgba(255,255,255,${alpha.toFixed(3)})`;
+        g.lineWidth=0.7+hash3(k+s*5,3.3)*0.9;
+        g.lineCap='round';
+        g.beginPath(); g.moveTo(x1,y1); g.quadraticCurveTo(mx,my,x2,y2); g.stroke();
+      }
+    }
+    ctx.save();
+    try{ ctx.filter='blur(2.2px)'; } catch(e){}
+    ctx.drawImage(sc,0,0);
+    try{ ctx.filter='none'; } catch(e){}
+    ctx.restore();
+
+    // crisp, unblurred sparkle on top — tiny bright foam bubbles clustered at the active edge
+    ctx.save();
+    for(let i=0;i<90;i++){
+      const k=Math.floor(hash3(i,3.1)*(nP-1));
+      const sy=-30+k*step+(hash3(i,9)-0.5)*step*2;
+      const r=reach[k];
+      const bx=coastSx[k]+(hash3(i,7.7)-0.2)*Math.max(2,r*0.95);
+      const flick=0.4+0.4*Math.sin(t*3+i*1.7);
+      ctx.fillStyle=`rgba(255,255,255,${(0.16+0.32*flick).toFixed(3)})`;
+      ctx.beginPath(); ctx.arc(bx,sy,0.5+hash3(i,2.2)*1.1,0,Math.PI*2); ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  componentWillUnmount(){ cancelAnimationFrame(this._raf); window.removeEventListener('resize',this._size); }
+  renderVals(){ return { cref:this.cref }; }
+}
+</script>
+</body>
+</html>
